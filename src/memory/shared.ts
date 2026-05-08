@@ -54,11 +54,21 @@ function isMemoryStore(v: unknown): v is MemoryStore {
  */
 export class SharedMemory {
   private readonly store: MemoryStore
+  /**
+   * Monotonic turn counter used to evaluate per-entry `expiresAtTurn`.
+   * Advanced explicitly via {@link advanceTurn}; not bound to any specific
+   * unit (the orchestrator drives it once per completed task in `runTeam` /
+   * `runTasks`).
+   */
+  private turnCount = 0
 
   /**
    * @param store - Optional custom {@link MemoryStore} backing this shared memory.
    *                Defaults to an in-process {@link InMemoryStore}. Custom stores
    *                receive namespaced keys (`<agentName>/<key>`) opaque to them.
+   *                Stores that don't implement {@link MemoryStore.setWithExpiry}
+   *                still work — `writeExpiring` falls back to plain `set` on
+   *                them and the entry never expires.
    *
    * @throws {TypeError} when `store` is provided but does not structurally
    *                     implement {@link MemoryStore} (fails fast on malformed
@@ -72,6 +82,28 @@ export class SharedMemory {
       )
     }
     this.store = store ?? new InMemoryStore()
+  }
+
+  // ---------------------------------------------------------------------------
+  // Turn counter
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Advance the turn counter by one. Entries previously written via
+   * {@link writeExpiring} with `ttlTurns: N` expire once the counter reaches
+   * `(write-time count) + N`.
+   *
+   * Called by the orchestrator after each completed task in `runTeam` and
+   * `runTasks`. Standalone `runAgent` does not advance the counter — there
+   * is no team turn boundary in single-agent runs.
+   */
+  advanceTurn(): void {
+    this.turnCount++
+  }
+
+  /** Current turn count. Useful for tests and observability. */
+  getTurnCount(): number {
+    return this.turnCount
   }
 
   // ---------------------------------------------------------------------------
@@ -102,6 +134,55 @@ export class SharedMemory {
     })
   }
 
+  /**
+   * Like {@link write}, but tags the entry with a turn-count expiry so it is
+   * automatically dropped from reads once the {@link advanceTurn} counter has
+   * advanced `ttlTurns` steps.
+   *
+   * Backends that don't implement {@link MemoryStore.setWithExpiry} fall back
+   * to a plain write — the entry persists indefinitely and `ttlTurns` is
+   * effectively ignored. Custom store authors who need TTL must implement
+   * the optional method.
+   *
+   * @param ttlTurns - Number of turns the entry should remain readable for.
+   *                   Must be an integer ≥ 1; throws {@link RangeError}
+   *                   otherwise.
+   *
+   * @throws {RangeError} when `ttlTurns` is not an integer or is less than 1.
+   *
+   * @remarks
+   * In parallel batch execution (`runTasks` / `runTeam` running multiple
+   * tasks in one batch) the turn counter advances per *completed* task, not
+   * per *invoked* task. So if task A writes a TTL entry while task B is
+   * still running, B completing first will advance the counter and may
+   * expire A's entry sooner than wall-clock intuition suggests. For
+   * cross-task hand-off semantics that need stricter ordering, write the
+   * entry without TTL and delete explicitly.
+   */
+  async writeExpiring(
+    agentName: string,
+    key: string,
+    value: string,
+    ttlTurns: number,
+    metadata?: Record<string, unknown>,
+  ): Promise<void> {
+    if (!Number.isInteger(ttlTurns) || ttlTurns < 1) {
+      throw new RangeError(
+        `SharedMemory.writeExpiring: ttlTurns must be an integer ≥ 1 (got ${ttlTurns}). ` +
+          'Use write() for entries that should never expire.',
+      )
+    }
+    const namespacedKey = SharedMemory.namespaceKey(agentName, key)
+    const fullMetadata = { ...metadata, agent: agentName }
+    if (typeof this.store.setWithExpiry === 'function') {
+      const expiresAtTurn = this.turnCount + ttlTurns
+      await this.store.setWithExpiry(namespacedKey, value, expiresAtTurn, fullMetadata)
+    } else {
+      // Custom store doesn't support TTL — degrade to plain set.
+      await this.store.set(namespacedKey, value, fullMetadata)
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // Read
   // ---------------------------------------------------------------------------
@@ -109,29 +190,38 @@ export class SharedMemory {
   /**
    * Read an entry by its fully-qualified key (`<agentName>/<key>`).
    *
-   * Returns `null` when the key is absent.
+   * Returns `null` when the key is absent **or** when the entry has expired
+   * (per its `expiresAtTurn` against the current turn counter). Expired
+   * entries are filtered out but **not** deleted from the underlying store —
+   * deletion is left to the store impl (Redis has native TTL, Postgres a
+   * cron, etc.). Reading is therefore safe to call from concurrent processes
+   * without the risk of stomping on a fresh write to the same key.
    */
   async read(key: string): Promise<MemoryEntry | null> {
-    return this.store.get(key)
+    const entry = await this.store.get(key)
+    if (entry === null) return null
+    if (this.isExpired(entry)) return null
+    return entry
   }
 
   // ---------------------------------------------------------------------------
   // List
   // ---------------------------------------------------------------------------
 
-  /** Returns every entry in the shared store, regardless of agent. */
+  /** Returns every non-expired entry in the shared store, regardless of agent. */
   async listAll(): Promise<MemoryEntry[]> {
-    return this.store.list()
+    return this.filterExpired(await this.store.list())
   }
 
   /**
-   * Returns all entries written by `agentName` (i.e. those whose key starts
-   * with `<agentName>/`).
+   * Returns all non-expired entries written by `agentName` (i.e. those whose
+   * key starts with `<agentName>/`).
    */
   async listByAgent(agentName: string): Promise<MemoryEntry[]> {
     const prefix = SharedMemory.namespaceKey(agentName, '')
     const all = await this.store.list()
-    return all.filter((entry) => entry.key.startsWith(prefix))
+    const live = this.filterExpired(all)
+    return live.filter((entry) => entry.key.startsWith(prefix))
   }
 
   // ---------------------------------------------------------------------------
@@ -160,6 +250,7 @@ export class SharedMemory {
    */
   async getSummary(filter?: { taskIds?: string[] }): Promise<string> {
     let all = await this.store.list()
+    all = this.filterExpired(all)
     if (filter?.taskIds && filter.taskIds.length > 0) {
       const taskIds = new Set(filter.taskIds)
       all = all.filter((entry) => {
@@ -221,5 +312,23 @@ export class SharedMemory {
 
   private static namespaceKey(agentName: string, key: string): string {
     return `${agentName}/${key}`
+  }
+
+  /** True when `entry.expiresAtTurn` is set and has been reached. */
+  private isExpired(entry: MemoryEntry): boolean {
+    return entry.expiresAtTurn !== undefined && this.turnCount >= entry.expiresAtTurn
+  }
+
+  /**
+   * Drops expired entries from `entries`. **Does not delete from the
+   * underlying store** — that would race with concurrent writers in
+   * distributed backends (the entry being deleted may have been
+   * overwritten with a fresh value between our read and our delete).
+   * Stores that want active cleanup should implement their own TTL sweep
+   * (Redis: native EXPIRE; Postgres: a cron). Entries without
+   * `expiresAtTurn` are always kept.
+   */
+  private filterExpired(entries: MemoryEntry[]): MemoryEntry[] {
+    return entries.filter((entry) => !this.isExpired(entry))
   }
 }
