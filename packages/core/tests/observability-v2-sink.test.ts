@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
+import { randomUUID } from 'node:crypto'
 import { createRunIdentity } from '../src/observability/identity.js'
 import type { TraceRecord, SpanEndRecord, SpanEventRecord, SpanStartRecord } from '../src/observability/records.js'
 import { TraceRuntime } from '../src/observability/runtime.js'
@@ -392,7 +393,7 @@ describe('OBS-2 composition, privacy, diagnostics, and compatibility', () => {
     const runtime = new TraceRuntime(createRunIdentity(), undefined, undefined, sync)
     const span = runtime.startSpan({ kind: 'agent', name: 'invoke_agent', parent: runtime.root })
     const legacy: TraceEvent = {
-      type: 'agent', runId: 'legacy', spanId: crypto.randomUUID(), agent: 'worker', turns: 1,
+      type: 'agent', runId: 'legacy', spanId: randomUUID(), agent: 'worker', turns: 1,
       tokens: { input_tokens: 1, output_tokens: 1 }, toolCalls: 0,
       startMs: 1, endMs: 2, durationMs: 1,
     }
@@ -411,7 +412,7 @@ describe('OBS-2 composition, privacy, diagnostics, and compatibility', () => {
     const bridge = new LegacyCallbackTraceSink((legacy) => { received.push(legacy) }, { diagnostics: 'silent' })
     const runtime = new TraceRuntime(createRunIdentity(), undefined, undefined, bridge)
     const baseEvent = {
-      runId: 'legacy-run', spanId: crypto.randomUUID(), agent: 'worker', startMs: 1, endMs: 2, durationMs: 1,
+      runId: 'legacy-run', spanId: randomUUID(), agent: 'worker', startMs: 1, endMs: 2, durationMs: 1,
     }
     const events: TraceEvent[] = [
       { ...baseEvent, type: 'llm_call', model: 'm', turn: 1, tokens: { input_tokens: 1, output_tokens: 1 } },
