@@ -1,7 +1,8 @@
-import { context, trace } from '@opentelemetry/api'
+import { context, SpanStatusCode, trace } from '@opentelemetry/api'
 import type {
   Attributes,
   Span,
+  SpanContext,
   Tracer,
   TracerProvider,
 } from '@opentelemetry/api'
@@ -91,8 +92,9 @@ interface SpanEntry {
   readonly span: Span
   readonly startUnixMs: number
   readonly linkKeys: Set<string>
-  ended: boolean
 }
+
+const MAX_RECENT_ROOT_CONTEXTS = 256
 
 function spanKey(traceId: string, spanId: string): string {
   return `${traceId}/${spanId}`
@@ -113,7 +115,10 @@ function lifecycleResult(status: 'success' | 'failure', code?: string): ExportRe
 export class OTelTraceExporter implements TraceExporter {
   private readonly tracer: Tracer
   private readonly provider?: OTelTracerProvider
-  private readonly spans = new Map<string, SpanEntry>()
+  private readonly openSpans = new Map<string, SpanEntry>()
+  private readonly spanContexts = new Map<string, SpanContext>()
+  private readonly traceSpanKeys = new Map<string, Set<string>>()
+  private readonly recentRootContexts = new Map<string, SpanContext>()
   private readonly shutdownOnShutdown: boolean
   private readonly metadata: Attributes
 
@@ -164,6 +169,10 @@ export class OTelTraceExporter implements TraceExporter {
   }
 
   async shutdown(signal: AbortSignal): Promise<ExportResult> {
+    this.finalizeAllOpenSpans(Date.now())
+    this.spanContexts.clear()
+    this.traceSpanKeys.clear()
+    this.recentRootContexts.clear()
     if (!this.shutdownOnShutdown || !this.provider?.shutdown) {
       this.diagnostic('shutdown_skipped', 'Provider shutdown was skipped because the adapter does not own the provider.')
       return lifecycleResult('success')
@@ -185,21 +194,22 @@ export class OTelTraceExporter implements TraceExporter {
 
   private start(record: SpanStartRecord): void {
     const key = spanKey(record.traceId, record.spanId)
-    if (this.spans.has(key)) {
+    if (this.openSpans.has(key) || this.spanContexts.has(key) || this.recentRootContexts.has(key)) {
       this.diagnostic('duplicate_span_start', 'Duplicate OMA span_start record ignored.')
       return
     }
-    this.spans.set(key, {
-      span: this.createSpan(record),
+    const span = this.createSpan(record)
+    this.registerSpanContext(record.traceId, key, span.spanContext())
+    this.openSpans.set(key, {
+      span,
       startUnixMs: record.startUnixMs,
       linkKeys: new Set(record.links?.map(linkKey)),
-      ended: false,
     })
   }
 
   private event(record: SpanEventRecord): void {
-    const entry = this.spans.get(spanKey(record.traceId, record.spanId))
-    if (!entry || entry.ended) {
+    const entry = this.openSpans.get(spanKey(record.traceId, record.spanId))
+    if (!entry) {
       this.diagnostic('orphan_event', 'OMA span_event arrived without an open OTel span and was ignored.')
       return
     }
@@ -219,21 +229,21 @@ export class OTelTraceExporter implements TraceExporter {
 
   private end(record: SpanEndRecord): void {
     const key = spanKey(record.traceId, record.spanId)
-    let entry = this.spans.get(key)
-    if (entry?.ended) {
+    let entry = this.openSpans.get(key)
+    if (!entry && (this.spanContexts.has(key) || this.recentRootContexts.has(key))) {
       this.diagnostic('duplicate_span_end', 'Duplicate OMA span_end record ignored.')
       return
     }
     if (!entry) {
       this.diagnostic('incomplete_span', 'OMA span_end arrived without span_start; a synthetic OTel span was created.')
       const span = this.createSpan(record, true)
+      this.registerSpanContext(record.traceId, key, span.spanContext())
       entry = {
         span,
         startUnixMs: record.startUnixMs,
         linkKeys: new Set(record.links?.map(linkKey)),
-        ended: false,
       }
-      this.spans.set(key, entry)
+      this.openSpans.set(key, entry)
     }
     try {
       entry.span.setAttributes({
@@ -258,7 +268,12 @@ export class OTelTraceExporter implements TraceExporter {
         entry.span.addEvent('exception', errorAttributes, record.endUnixMs)
       }
       entry.span.end(record.endUnixMs)
-      entry.ended = true
+      this.openSpans.delete(key)
+      if (record.kind === 'run') {
+        const rootContext = this.spanContexts.get(key)
+        if (rootContext) this.rememberRootContext(key, rootContext)
+        this.finalizeTrace(record.traceId, record.endUnixMs)
+      }
     } catch {
       this.diagnostic('span_end_failed', 'The OpenTelemetry tracer rejected an OMA span_end record.')
       throw new Error('OTEL_SPAN_END_FAILED')
@@ -267,9 +282,9 @@ export class OTelTraceExporter implements TraceExporter {
 
   private createSpan(record: SpanStartRecord | SpanEndRecord, incomplete = false): Span {
     const parent = record.parentSpanId
-      ? this.spans.get(spanKey(record.traceId, record.parentSpanId))
+      ? this.spanContexts.get(spanKey(record.traceId, record.parentSpanId))
       : undefined
-    const parentContext = parent ? trace.setSpan(context.active(), parent.span) : undefined
+    const parentContext = parent ? trace.setSpanContext(context.active(), parent) : undefined
     const attributes: Attributes = {
       ...spanAttributes(record),
       ...this.metadata,
@@ -278,7 +293,7 @@ export class OTelTraceExporter implements TraceExporter {
     const span = this.tracer.startSpan(record.name, {
       kind: mapSpanKind(record.kind),
       attributes,
-      links: record.links?.map(mapLink),
+      links: record.links?.map((link) => this.mapLink(link)),
       startTime: record.startUnixMs,
     }, parentContext)
     return span
@@ -292,8 +307,64 @@ export class OTelTraceExporter implements TraceExporter {
     for (const link of links ?? []) {
       const key = linkKey(link)
       if (entry.linkKeys.has(key)) continue
-      entry.span.addLink(mapLink(link))
+      entry.span.addLink(this.mapLink(link))
       entry.linkKeys.add(key)
+    }
+  }
+
+  private mapLink(link: TraceLink) {
+    const key = spanKey(link.traceId, link.spanId)
+    return mapLink(link, this.spanContexts.get(key) ?? this.recentRootContexts.get(key))
+  }
+
+  private registerSpanContext(traceId: string, key: string, spanContext: SpanContext): void {
+    this.spanContexts.set(key, spanContext)
+    let keys = this.traceSpanKeys.get(traceId)
+    if (!keys) {
+      keys = new Set()
+      this.traceSpanKeys.set(traceId, keys)
+    }
+    keys.add(key)
+  }
+
+  private rememberRootContext(key: string, spanContext: SpanContext): void {
+    this.recentRootContexts.delete(key)
+    this.recentRootContexts.set(key, spanContext)
+    while (this.recentRootContexts.size > MAX_RECENT_ROOT_CONTEXTS) {
+      const oldest = this.recentRootContexts.keys().next().value as string | undefined
+      if (oldest === undefined) break
+      this.recentRootContexts.delete(oldest)
+    }
+  }
+
+  private finalizeTrace(traceId: string, endUnixMs: number): void {
+    const keys = this.traceSpanKeys.get(traceId)
+    if (!keys) return
+    for (const key of keys) {
+      const entry = this.openSpans.get(key)
+      if (entry) this.finalizeIncompleteSpan(key, entry, endUnixMs)
+      this.spanContexts.delete(key)
+    }
+    this.traceSpanKeys.delete(traceId)
+  }
+
+  private finalizeAllOpenSpans(endUnixMs: number): void {
+    for (const [key, entry] of this.openSpans) {
+      this.finalizeIncompleteSpan(key, entry, endUnixMs)
+    }
+    this.openSpans.clear()
+  }
+
+  private finalizeIncompleteSpan(key: string, entry: SpanEntry, endUnixMs: number): void {
+    this.diagnostic('incomplete_span', 'OMA trace closed without span_end; the open OTel span was ended as incomplete.')
+    try {
+      entry.span.setAttribute('oma.record.incomplete', true)
+      entry.span.setStatus({ code: SpanStatusCode.UNSET })
+      entry.span.end(endUnixMs)
+    } catch {
+      this.diagnostic('span_end_failed', 'The OpenTelemetry tracer rejected cleanup of an incomplete OMA span.')
+    } finally {
+      this.openSpans.delete(key)
     }
   }
 

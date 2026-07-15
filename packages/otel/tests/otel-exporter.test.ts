@@ -1,4 +1,4 @@
-import { SpanStatusCode } from '@opentelemetry/api'
+import { SpanStatusCode, TraceFlags } from '@opentelemetry/api'
 import {
   BasicTracerProvider,
   InMemorySpanExporter,
@@ -33,6 +33,9 @@ function start(
     attributes?: Readonly<Record<string, TraceAttributeValue>>
     links?: readonly TraceLink[]
     startUnixMs?: number
+    traceId?: string
+    runId?: string
+    attempt?: number
   } = {},
 ): SpanStartRecord {
   const startUnixMs = options.startUnixMs ?? 1_000
@@ -41,9 +44,9 @@ function start(
     recordId: `start-${++nextRecord}`,
     sequence: nextRecord,
     timestampUnixMs: startUnixMs,
-    runId: 'run-42',
-    attempt: 2,
-    traceId: TRACE_ID,
+    runId: options.runId ?? 'run-42',
+    attempt: options.attempt ?? 2,
+    traceId: options.traceId ?? TRACE_ID,
     spanId,
     ...(options.parentSpanId ? { parentSpanId: options.parentSpanId } : {}),
     recordType: 'span_start',
@@ -88,6 +91,9 @@ function end(
     error?: SpanEndRecord['error']
     startUnixMs?: number
     endUnixMs?: number
+    traceId?: string
+    runId?: string
+    attempt?: number
   } = {},
 ): SpanEndRecord {
   const startUnixMs = options.startUnixMs ?? 1_000
@@ -97,9 +103,9 @@ function end(
     recordId: `end-${++nextRecord}`,
     sequence: nextRecord,
     timestampUnixMs: endUnixMs,
-    runId: 'run-42',
-    attempt: 2,
-    traceId: TRACE_ID,
+    runId: options.runId ?? 'run-42',
+    attempt: options.attempt ?? 2,
+    traceId: options.traceId ?? TRACE_ID,
     spanId,
     ...(options.parentSpanId ? { parentSpanId: options.parentSpanId } : {}),
     recordType: 'span_end',
@@ -151,10 +157,10 @@ describe('@open-multi-agent/otel', () => {
     const checkpointId = '8'.repeat(16)
     const callbackId = '9'.repeat(16)
     const links: readonly TraceLink[] = [
-      { traceId: 'b'.repeat(32), spanId: 'b'.repeat(16), relation: 'depends_on' },
-      { traceId: 'c'.repeat(32), spanId: 'c'.repeat(16), relation: 'delegated_from' },
-      { traceId: 'd'.repeat(32), spanId: 'd'.repeat(16), relation: 'consumed' },
-      { traceId: 'e'.repeat(32), spanId: 'e'.repeat(16), relation: 'continued_from' },
+      { traceId: TRACE_ID, spanId: planId, relation: 'depends_on' },
+      { traceId: TRACE_ID, spanId: consensusId, relation: 'delegated_from' },
+      { traceId: TRACE_ID, spanId: checkpointId, relation: 'consumed' },
+      { traceId: TRACE_ID, spanId: callbackId, relation: 'continued_from' },
     ]
 
     const result = await exportRecords(adapter, [
@@ -232,6 +238,22 @@ describe('@open-multi-agent/otel', () => {
     expect(task.links).toHaveLength(4)
     expect(task.links.map((link) => link.attributes['oma.link.relation']))
       .toEqual(['depends_on', 'delegated_from', 'consumed', 'continued_from'])
+    const expectedLinkTargets = new Map([
+      ['depends_on', spans.find((span) => span.name === 'coordinator.decomposition')!],
+      ['delegated_from', spans.find((span) => span.name === 'consensus.judge')!],
+      ['consumed', spans.find((span) => span.name === 'checkpoint.restore')!],
+      ['continued_from', spans.find((span) => span.name === 'coordinator.synthesis')!],
+    ])
+    for (const link of task.links) {
+      const relation = link.attributes['oma.link.relation'] as string
+      const target = expectedLinkTargets.get(relation)!
+      expect(link.context).toEqual(target.spanContext())
+      expect(link.attributes).toMatchObject({
+        'oma.link.resolved': true,
+        'oma.link.target.trace_id': TRACE_ID,
+        'oma.link.target.span_id': target.attributes['oma.span.id'],
+      })
+    }
     expect(task.events.some((item) => item.name === 'oma.retry_scheduled')).toBe(true)
     expect(task.events.some((item) => item.name === 'oma.stream_chunk')).toBe(true)
     expect(llm.attributes).toMatchObject({
@@ -248,6 +270,150 @@ describe('@open-multi-agent/otel', () => {
       'gen_ai.response.time_to_first_chunk': 0.6,
     })
     expect(llm.events.some((item) => item.name === 'oma.first_chunk')).toBe(true)
+  })
+
+  it('resolves recent-root continuation links and marks unknown cross-process links as remote', async () => {
+    const { exporter, provider } = inMemory()
+    const adapter = createOtelTraceExporter({ tracerProvider: provider })
+    const previousTraceId = 'b'.repeat(32)
+    const previousRootId = 'b'.repeat(16)
+    await exportRecords(adapter, [
+      start(previousRootId, 'previous.run', 'run', { traceId: previousTraceId, runId: 'continued-run', attempt: 1 }),
+      end(previousRootId, 'previous.run', 'run', { traceId: previousTraceId, runId: 'continued-run', attempt: 1 }),
+    ])
+    const previous = exporter.getFinishedSpans().find((span) => span.name === 'previous.run')!
+
+    const restoredTraceId = 'c'.repeat(32)
+    const restoredRootId = 'c'.repeat(16)
+    const continuedFrom: TraceLink = {
+      traceId: previousTraceId,
+      spanId: previousRootId,
+      relation: 'continued_from',
+    }
+    await exportRecords(adapter, [
+      start(restoredRootId, 'restored.run', 'run', {
+        traceId: restoredTraceId,
+        runId: 'continued-run',
+        attempt: 2,
+        links: [continuedFrom],
+      }),
+      end(restoredRootId, 'restored.run', 'run', {
+        traceId: restoredTraceId,
+        runId: 'continued-run',
+        attempt: 2,
+        links: [continuedFrom],
+      }),
+    ])
+    const restored = exporter.getFinishedSpans().find((span) => span.name === 'restored.run')!
+    expect(restored.links[0]!.context).toEqual(previous.spanContext())
+    expect(restored.links[0]!.attributes['oma.link.resolved']).toBe(true)
+
+    const fresh = inMemory()
+    const freshAdapter = createOtelTraceExporter({ tracerProvider: fresh.provider })
+    const unknownTraceId = 'd'.repeat(32)
+    const unknownSpanId = 'd'.repeat(16)
+    const unknownLink: TraceLink = {
+      traceId: unknownTraceId,
+      spanId: unknownSpanId,
+      relation: 'continued_from',
+    }
+    const freshRootId = 'e'.repeat(16)
+    await exportRecords(freshAdapter, [
+      start(freshRootId, 'fresh.run', 'run', { links: [unknownLink] }),
+      end(freshRootId, 'fresh.run', 'run', { links: [unknownLink] }),
+    ])
+    const unresolved = fresh.exporter.getFinishedSpans().find((span) => span.name === 'fresh.run')!.links[0]!
+    expect(unresolved.context).toEqual({
+      traceId: unknownTraceId,
+      spanId: unknownSpanId,
+      traceFlags: TraceFlags.NONE,
+      isRemote: true,
+    })
+    expect(unresolved.attributes).toMatchObject({
+      'oma.link.resolved': false,
+      'oma.link.target.trace_id': unknownTraceId,
+      'oma.link.target.span_id': unknownSpanId,
+    })
+  })
+
+  it('parents children from retained contexts after the parent Span object is released', async () => {
+    const { exporter, provider } = inMemory()
+    const adapter = createOtelTraceExporter({ tracerProvider: provider })
+    const parentId = '2'.repeat(16)
+    const childId = '3'.repeat(16)
+    await exportRecords(adapter, [
+      start(ROOT_SPAN_ID, 'oma.run', 'run'),
+      start(parentId, 'completed.parent', 'task', { parentSpanId: ROOT_SPAN_ID }),
+      end(parentId, 'completed.parent', 'task', { parentSpanId: ROOT_SPAN_ID }),
+      start(childId, 'late.child', 'agent', { parentSpanId: parentId }),
+      end(childId, 'late.child', 'agent', { parentSpanId: parentId }),
+      end(ROOT_SPAN_ID, 'oma.run', 'run'),
+    ])
+    const parent = exporter.getFinishedSpans().find((span) => span.name === 'completed.parent')!
+    const child = exporter.getFinishedSpans().find((span) => span.name === 'late.child')!
+    expect(child.parentSpanContext).toEqual(parent.spanContext())
+  })
+
+  it('releases completed traces and bounds recent root contexts', async () => {
+    const { provider } = inMemory()
+    const adapter = createOtelTraceExporter({ tracerProvider: provider })
+    const state = adapter as unknown as {
+      openSpans: Map<string, unknown>
+      spanContexts: Map<string, unknown>
+      traceSpanKeys: Map<string, unknown>
+      recentRootContexts: Map<string, unknown>
+    }
+
+    for (let index = 1; index <= 300; index++) {
+      const traceId = index.toString(16).padStart(32, '0')
+      const rootId = index.toString(16).padStart(16, '0')
+      await adapter.export([
+        start(rootId, `run.${index}`, 'run', { traceId, runId: `run-${index}`, attempt: 1 }),
+        end(rootId, `run.${index}`, 'run', { traceId, runId: `run-${index}`, attempt: 1 }),
+      ], new AbortController().signal)
+    }
+
+    expect(state.openSpans.size).toBe(0)
+    expect(state.spanContexts.size).toBe(0)
+    expect(state.traceSpanKeys.size).toBe(0)
+    expect(state.recentRootContexts.size).toBe(256)
+  })
+
+  it('ends and clears incomplete spans when a root closes or the exporter shuts down', async () => {
+    const rootCase = inMemory()
+    const diagnostics: string[] = []
+    const rootAdapter = createOtelTraceExporter({
+      tracerProvider: rootCase.provider,
+      onDiagnostic: (item) => diagnostics.push(item.code),
+    })
+    const childId = '4'.repeat(16)
+    await exportRecords(rootAdapter, [
+      start(ROOT_SPAN_ID, 'oma.run', 'run'),
+      start(childId, 'missing.end', 'task', { parentSpanId: ROOT_SPAN_ID }),
+      end(ROOT_SPAN_ID, 'oma.run', 'run'),
+    ])
+    const incompleteChild = rootCase.exporter.getFinishedSpans().find((span) => span.name === 'missing.end')!
+    expect(incompleteChild.attributes['oma.record.incomplete']).toBe(true)
+    expect(incompleteChild.status.code).toBe(SpanStatusCode.UNSET)
+    expect(diagnostics).toContain('incomplete_span')
+
+    const shutdownCase = inMemory()
+    const shutdownAdapter = createOtelTraceExporter({ tracerProvider: shutdownCase.provider })
+    const openId = '5'.repeat(16)
+    await shutdownAdapter.export([start(openId, 'shutdown.incomplete', 'task')], new AbortController().signal)
+    await shutdownAdapter.shutdown(new AbortController().signal)
+    const shutdownSpan = shutdownCase.exporter.getFinishedSpans().find((span) => span.name === 'shutdown.incomplete')!
+    expect(shutdownSpan.attributes['oma.record.incomplete']).toBe(true)
+    const shutdownState = shutdownAdapter as unknown as {
+      openSpans: Map<string, unknown>
+      spanContexts: Map<string, unknown>
+      traceSpanKeys: Map<string, unknown>
+      recentRootContexts: Map<string, unknown>
+    }
+    expect(shutdownState.openSpans.size).toBe(0)
+    expect(shutdownState.spanContexts.size).toBe(0)
+    expect(shutdownState.traceSpanKeys.size).toBe(0)
+    expect(shutdownState.recentRootContexts.size).toBe(0)
   })
 
   it('maps OMA error statuses without leaking error messages and keeps non-errors Unset', async () => {

@@ -44,6 +44,11 @@ The caller owns the tracer/provider in every mode.
 - `sink.shutdown()` does **not** shut down a caller-owned provider by default.
   Set `shutdownOnShutdown: true` only when this adapter is the component that
   owns the provider lifecycle.
+- Completed OTel `Span` objects are released immediately. Lightweight contexts
+  remain only until their OMA root closes; the 256 most recent root contexts
+  are retained so a same-process checkpoint restore can resolve its continuation
+  link. Shutdown ends any still-open span as incomplete and clears all adapter
+  state.
 - Provider rejection or timeout becomes the OBS-2 exporter result and sink
   diagnostics/stats; it never changes an Agent, Task, or Run result.
 
@@ -65,7 +70,21 @@ orphan events are ignored with payload-free diagnostics.
 | LLM | `CLIENT` span with compatible `gen_ai.*` attributes |
 | tool / delegation | `INTERNAL` span; delegated task relation is an OTel link |
 | retry / consensus verdict / stream chunks | `oma.*` events |
-| DAG / restore / synthesis consumption | OTel links with `oma.link.relation` |
+| DAG / restore / synthesis consumption | OTel links with `oma.link.relation` and explicit resolution metadata |
+
+When the referenced span was observed by the same adapter, the OTel link uses
+that span's actual SDK-generated `SpanContext`, so backends can resolve it to the
+exported span. This covers DAG dependencies, delegation, synthesis consumption,
+and same-process checkpoint restore. Every link also records
+`oma.link.resolved`, `oma.link.target.trace_id`, and
+`oma.link.target.span_id`; the target IDs are the stable OMA identifiers.
+
+After a process restart, the adapter has no access to the previous provider's
+SDK-generated context because checkpoints intentionally contain only OMA IDs.
+Such a `continued_from` link remains a valid remote OTel link using the OMA IDs,
+`TraceFlags.NONE`, and `oma.link.resolved = false`. Use its target attributes
+for correlation; a backend cannot be expected to navigate it to the previously
+exported OTel span.
 
 Stable correlation attributes include `oma.schema.version = 2`,
 `oma.run.id`, `oma.run.attempt`, `oma.trace.id`, `oma.span.id`,

@@ -174,17 +174,21 @@ export function mapStatus(status: RunStatus): SpanStatus {
   return { code: SpanStatusCode.UNSET }
 }
 
-export function mapLink(link: TraceLink): Link {
-  const context: SpanContext = {
+export function mapLink(link: TraceLink, resolvedContext?: SpanContext): Link {
+  const resolved = resolvedContext !== undefined
+  const context: SpanContext = resolvedContext ?? {
     traceId: link.traceId,
     spanId: link.spanId,
-    traceFlags: TraceFlags.SAMPLED,
-    isRemote: false,
+    traceFlags: TraceFlags.NONE,
+    isRemote: true,
   }
   return {
     context,
     attributes: {
       'oma.link.relation': link.relation,
+      'oma.link.resolved': resolved,
+      'oma.link.target.trace_id': link.traceId,
+      'oma.link.target.span_id': link.spanId,
       ...mapOmaAttributes(link.attributes ?? {}),
     },
   }

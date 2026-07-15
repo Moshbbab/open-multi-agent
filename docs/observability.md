@@ -241,6 +241,20 @@ record ID, and sequence as stable `oma.*` attributes. It maps `error`,
 `timeout`, and `budget_exhausted` to OTel `Error`; all remaining OMA statuses
 remain OTel `Unset` and are preserved in `oma.status`.
 
+Links whose targets were observed by the same adapter use the target span's
+actual SDK-generated OTel context. Each link records `oma.link.resolved` plus
+the stable OMA target trace/span IDs. A same-process restore resolves through a
+bounded cache of the 256 most recent root contexts. After a process restart the
+previous SDK context is unavailable, so `continued_from` falls back to a remote
+unsampled context built from the OMA IDs and marks itself unresolved; the OMA
+target attributes remain available for correlation.
+
+Completed OTel `Span` objects are released immediately. Lightweight contexts
+live only until their root span closes, at which point the trace-local registry
+is cleared. Root close and adapter shutdown end any remaining open spans as
+incomplete before clearing state, so telemetry loss cannot produce an unbounded
+live-span registry.
+
 For LLM/tool spans it also emits a bounded compatibility subset of the current
 development-status GenAI conventions (provider/model, token/cache/reasoning
 counts, tool name, and TTFT). Every span records
