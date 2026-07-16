@@ -356,6 +356,10 @@ export interface ToolUseContext {
   readonly cwd?: string | null
   /** Arbitrary caller-supplied metadata (session ID, request ID, etc.). */
   readonly metadata?: Readonly<Record<string, unknown>>
+  /** Run ID associated with this tool call, when available. */
+  readonly runId?: string
+  /** Task ID associated with this tool call, when available. */
+  readonly taskId?: string
   /**
    * Per-agent scoped secrets for tool code to consume (API tokens, service
    * keys, etc.), sourced from {@link AgentConfig.credentials}. A tool reads
@@ -376,6 +380,29 @@ export interface AgentInfo {
   readonly name: string
   readonly role: string
   readonly model: string
+}
+
+/** Context passed to the optional per-call tool gate. */
+export interface ToolCallContext {
+  readonly toolName: string
+  readonly input: Record<string, unknown>
+  readonly agentName: string
+  readonly runId?: string
+  readonly taskId?: string
+}
+
+/** Decision returned by the optional per-call tool gate. */
+export type ToolCallDecision =
+  | { readonly action: 'allow' }
+  | { readonly action: 'deny'; readonly reason?: string }
+
+/** Optional middleware invoked after input validation and before tool execution. */
+export type ToolCallGate = (context: ToolCallContext) => ToolCallDecision | Promise<ToolCallDecision>
+
+/** Metadata attached to tool results when a per-call gate runs. */
+export interface ToolCallGateMetadata {
+  readonly action: ToolCallDecision['action']
+  readonly reason?: string
 }
 
 /**
@@ -424,6 +451,8 @@ export interface ToolResultMetadata {
    * total so budgets/cost tracking stay accurate across delegation.
    */
   readonly tokenUsage?: TokenUsage
+  /** Per-call gate decision, if an onToolCall hook evaluated this tool call. */
+  readonly toolCallGate?: ToolCallGateMetadata
 }
 
 /** Value returned by a tool's `execute` function. */
@@ -509,7 +538,7 @@ export interface BeforeRunHookContext {
 
 /**
  * A minimal, SDK-agnostic view of an ACP `session/request_permission` prompt,
- * passed to a {@link AgentBackendConfig.permission} callback so callers can decide
+ * passed to a {@link AcpAgentBackendConfig.permission} callback so callers can decide
  * without importing `@agentclientprotocol/sdk`.
  */
 export interface AcpPermissionRequest {
@@ -541,11 +570,10 @@ export type AcpPermissionPolicy =
  * own agentic loop, while OMA drives it, collects its output and token usage, and
  * schedules it in the task DAG alongside LLM agents.
  *
- * A discriminated union keyed by {@link kind}; only `'acp'` exists today.
  * Requires the optional peer `@agentclientprotocol/sdk`.
  */
 export interface AgentBackendConfig {
-  /** Backend discriminant. Only `'acp'` is supported today. */
+  /** Backend discriminant. */
   readonly kind: 'acp'
   /** Executable to spawn (e.g. `'npx'`, `'gemini'`, `'codex-acp'`). */
   readonly command: string
@@ -562,6 +590,42 @@ export interface AgentBackendConfig {
   /** How to answer the agent's permission prompts. Defaults to `'auto-approve'`. */
   readonly permission?: AcpPermissionPolicy
 }
+
+/** Alias for the ACP backend config; `AgentBackendConfig` is kept for v1.10 compatibility. */
+export interface AcpAgentBackendConfig extends AgentBackendConfig {}
+
+/** How a generic process backend receives a prompt. */
+export type ProcessBackendInputMode = 'stdin' | 'argument' | 'none'
+
+/**
+ * Configuration for running a generic local process as an OMA team member.
+ *
+ * Unlike ACP, this backend does not speak an agent protocol. It starts a fresh
+ * process per run, sends the prompt by stdin or final argument, maps stdout to
+ * the agent output, and treats non-zero exits as task failures.
+ */
+export interface ProcessAgentBackendConfig {
+  /** Backend discriminant. */
+  readonly kind: 'process'
+  /** Executable to spawn (e.g. `'node'`, `'python'`, `'my-cli'`). */
+  readonly command: string
+  /** Arguments passed to `command` before the prompt argument, if any. */
+  readonly args?: readonly string[]
+  /** Extra environment variables for the subprocess, merged over `process.env`. */
+  readonly env?: Readonly<Record<string, string>>
+  /** Working directory for the subprocess. Defaults to `process.cwd()`. */
+  readonly cwd?: string
+  /**
+   * Prompt delivery mode. Defaults to `'stdin'`.
+   * - `'stdin'`: write the prompt to stdin and close it.
+   * - `'argument'`: append the prompt as the final command argument.
+   * - `'none'`: do not send the prompt; useful for fixed command adapters.
+   */
+  readonly input?: ProcessBackendInputMode
+}
+
+/** External backend configuration keyed by `kind`. */
+export type ExternalAgentBackendConfig = AgentBackendConfig | ProcessAgentBackendConfig
 
 /** Static configuration for a single agent. */
 export interface AgentConfig {
@@ -583,15 +647,16 @@ export interface AgentConfig {
    */
   readonly adapter?: LLMAdapter
   /**
-   * Run this agent on an external {@link AgentBackendConfig} (e.g. a coding CLI
-   * over the Agent Client Protocol) instead of an LLM adapter. When set, the
+   * Run this agent on an external {@link ExternalAgentBackendConfig} instead of
+   * an LLM adapter. When set, the
    * LLM-specific fields (`model`, `provider`, `adapter`, sampling, tools, context
    * strategy) do not apply — the external agent runs its own loop — but the agent
    * still participates in the task DAG, shared memory, cascade-on-failure, and
-   * token budget like any other team member. Requires the optional peer
-   * `@agentclientprotocol/sdk`; import the backend from `@open-multi-agent/core/acp`.
+   * token budget like any other team member. ACP backends require the optional
+   * peer `@agentclientprotocol/sdk`; generic process backends use Node child
+   * processes and do not require an optional peer.
    */
-  readonly backend?: AgentBackendConfig
+  readonly backend?: ExternalAgentBackendConfig
   readonly provider?: SupportedProvider
   /**
    * Custom base URL for OpenAI-compatible APIs (Ollama, vLLM, LM Studio, etc.).
@@ -618,6 +683,12 @@ export interface AgentConfig {
   readonly tools?: readonly string[]
   /** Names of tools explicitly disallowed for this agent. */
   readonly disallowedTools?: readonly string[]
+  /**
+   * Optional per-call tool gate. Called after tool input validates and before
+   * execution. Return `{ action: 'deny' }` to surface an error ToolResult to the
+   * model without throwing or invoking the tool implementation.
+   */
+  readonly onToolCall?: ToolCallGate
   /** Predefined tool preset for common use cases. */
   readonly toolPreset?: 'readonly' | 'readwrite' | 'full'
   /**
@@ -1346,6 +1417,12 @@ export interface OrchestratorConfig {
   readonly observability?: import('./observability/sink.js').ObservabilityConfig
   readonly onTrace?: (event: TraceEvent) => void | Promise<void>
   /**
+   * Optional per-call tool gate inherited by agents that do not define their own
+   * {@link AgentConfig.onToolCall}. This is a coordination layer, not a sandbox
+   * or security boundary.
+   */
+  readonly onToolCall?: ToolCallGate
+  /**
    * Optional approval gate called between task execution rounds.
    *
    * After a batch of tasks completes, this callback receives all
@@ -1594,6 +1671,8 @@ export interface CoordinatorConfig {
   readonly tools?: readonly string[]
   /** Tool names explicitly denied to the coordinator. */
   readonly disallowedTools?: readonly string[]
+  /** See {@link AgentConfig.onToolCall}. */
+  readonly onToolCall?: ToolCallGate
   /**
    * Root directory used by the coordinator's filesystem tools.
    * Defaults to {@link OrchestratorConfig.defaultCwd}. Pass `null` to
@@ -1656,6 +1735,12 @@ export interface ToolCallTrace extends TraceEventBase {
   readonly type: 'tool_call'
   readonly tool: string
   readonly isError: boolean
+  /** True when an onToolCall gate evaluated this tool invocation. */
+  readonly gated?: boolean
+  /** Decision returned by the gate, when one evaluated this call. */
+  readonly gateAction?: ToolCallDecision['action']
+  /** Optional denial/debug reason supplied by the gate. */
+  readonly gateReason?: string
   /** The input arguments passed to the tool after best-effort sensitive-field redaction. */
   readonly input: Record<string, unknown>
   /** The serialised output returned by the tool after executor truncation and best-effort sensitive-value redaction. */

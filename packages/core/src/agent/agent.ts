@@ -37,7 +37,7 @@
  */
 
 import type {
-  AgentBackendConfig,
+  ExternalAgentBackendConfig,
   AgentConfig,
   AgentState,
   AgentRunResult,
@@ -191,6 +191,7 @@ export class Agent {
       toolPreset: this.config.toolPreset,
       allowedTools: this.config.tools,
       disallowedTools: this.config.disallowedTools,
+      ...(this.config.onToolCall !== undefined ? { onToolCall: this.config.onToolCall } : {}),
       cwd: this.config.cwd,
       agentName: this.name,
       agentRole: this.config.systemPrompt?.slice(0, 50) ?? 'assistant',
@@ -220,7 +221,7 @@ export class Agent {
    * The backend module is loaded via dynamic `import()` so its optional peer SDK
    * (e.g. `@agentclientprotocol/sdk`) is only resolved when a backend is used.
    */
-  private async createExternalBackend(backend: AgentBackendConfig): Promise<AgentBackend> {
+  private async createExternalBackend(backend: ExternalAgentBackendConfig): Promise<AgentBackend> {
     switch (backend.kind) {
       case 'acp': {
         const { createAcpBackend } = await import('./acp-backend.js')
@@ -236,6 +237,18 @@ export class Agent {
           agentName: this.name,
           model: this.config.model,
           callTimeoutMs: this.config.callTimeoutMs,
+        })
+      }
+      case 'process': {
+        const { createProcessBackend } = await import('./process-backend.js')
+        return createProcessBackend({
+          command: backend.command,
+          args: backend.args,
+          env: backend.env,
+          cwd: backend.cwd,
+          input: backend.input,
+          systemPrompt: this.config.systemPrompt,
+          agentName: this.name,
         })
       }
       default:
