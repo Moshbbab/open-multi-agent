@@ -526,6 +526,50 @@ describe('@open-multi-agent/otel', () => {
     expect(JSON.stringify({ attributes: span.attributes, events: span.events })).not.toContain('not exported')
   })
 
+  it('reports span_event and span_end failures with their own single diagnostic code', async () => {
+    const { provider } = inMemory()
+    const failOn = (method: 'addEvent' | 'end'): Tracer => {
+      const tracer = provider.getTracer('test')
+      return {
+        startSpan: (...args: Parameters<Tracer['startSpan']>) => new Proxy(tracer.startSpan(...args), {
+          get(target, prop) {
+            if (prop === method) return () => { throw new Error(`${method} rejected`) }
+            const value = Reflect.get(target, prop) as unknown
+            return typeof value === 'function' ? (value as (...fnArgs: unknown[]) => unknown).bind(target) : value
+          },
+        }),
+      } as unknown as Tracer
+    }
+
+    const eventDiagnostics: string[] = []
+    const eventCase = createOtelTraceExporter({
+      tracer: failOn('addEvent'),
+      onDiagnostic: (item) => eventDiagnostics.push(item.code),
+    })
+    const eventId = '6'.repeat(15) + 'e'
+    await expect(eventCase.export([
+      start(eventId, 'oma.task', 'task'),
+      event(eventId, 'retry_scheduled'),
+    ], new AbortController().signal)).resolves.toEqual({
+      status: 'failure', exported: 1, code: 'OTEL_SPAN_EVENT_FAILED',
+    })
+    expect(eventDiagnostics).toEqual(['span_event_failed'])
+
+    const endDiagnostics: string[] = []
+    const endCase = createOtelTraceExporter({
+      tracer: failOn('end'),
+      onDiagnostic: (item) => endDiagnostics.push(item.code),
+    })
+    const endId = '7'.repeat(15) + 'f'
+    await expect(endCase.export([
+      start(endId, 'oma.task', 'task'),
+      end(endId, 'oma.task', 'task'),
+    ], new AbortController().signal)).resolves.toEqual({
+      status: 'failure', exported: 1, code: 'OTEL_SPAN_END_FAILED',
+    })
+    expect(endDiagnostics).toEqual(['span_end_failed'])
+  })
+
   it('maps local span rejection and provider flush/shutdown failures to OBS-2 ExportResult without taking provider ownership by default', async () => {
     const { provider } = inMemory()
     const diagnostics: string[] = []
@@ -535,7 +579,7 @@ describe('@open-multi-agent/otel', () => {
     } as unknown as Tracer
     const rejected = createOtelTraceExporter({ tracer: throwingTracer })
     await expect(rejected.export([start('5'.repeat(16), 'oma.run', 'run')], new AbortController().signal))
-      .resolves.toEqual({ status: 'failure', exported: 0, code: 'OTEL_RECORD_REJECTED' })
+      .resolves.toEqual({ status: 'failure', exported: 0, code: 'OTEL_SPAN_START_FAILED' })
 
     let starts = 0
     const partiallyRejectingTracer = {
@@ -551,7 +595,7 @@ describe('@open-multi-agent/otel', () => {
       start('6'.repeat(16), 'oma.run', 'run'),
       start('7'.repeat(16), 'oma.task', 'task'),
     ], new AbortController().signal)).resolves.toEqual({
-      status: 'failure', exported: 1, code: 'OTEL_RECORD_REJECTED',
+      status: 'failure', exported: 1, code: 'OTEL_SPAN_START_FAILED',
     })
 
     let flushed = 0

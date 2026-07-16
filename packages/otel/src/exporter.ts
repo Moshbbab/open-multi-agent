@@ -26,11 +26,13 @@ import {
   mapStatus,
   spanAttributes,
 } from './mapping.js'
+import { PACKAGE_VERSION } from './version.js'
 
 export type OTelDiagnosticCode =
   | 'span_start_failed'
   | 'duplicate_span_start'
   | 'orphan_event'
+  | 'span_event_failed'
   | 'duplicate_span_end'
   | 'incomplete_span'
   | 'span_end_failed'
@@ -108,6 +110,28 @@ function lifecycleResult(status: 'success' | 'failure', code?: string): ExportRe
   return { status, exported: 0, ...(code ? { code } : {}) }
 }
 
+const ACCEPT_FAILURES: Record<TraceRecord['recordType'], {
+  readonly diagnostic: OTelDiagnosticCode
+  readonly message: string
+  readonly code: string
+}> = {
+  span_start: {
+    diagnostic: 'span_start_failed',
+    message: 'The OpenTelemetry tracer rejected an OMA span_start record.',
+    code: 'OTEL_SPAN_START_FAILED',
+  },
+  span_event: {
+    diagnostic: 'span_event_failed',
+    message: 'The OpenTelemetry tracer rejected an OMA span_event record.',
+    code: 'OTEL_SPAN_EVENT_FAILED',
+  },
+  span_end: {
+    diagnostic: 'span_end_failed',
+    message: 'The OpenTelemetry tracer rejected an OMA span_end record.',
+    code: 'OTEL_SPAN_END_FAILED',
+  },
+}
+
 /**
  * Adapts OMA TraceRecord v2 to an application-owned OpenTelemetry tracer.
  * It deliberately does not configure or replace OpenTelemetry's global provider.
@@ -132,7 +156,7 @@ export class OTelTraceExporter implements TraceExporter {
     this.provider = options.tracerProvider
     this.tracer = options.tracer ?? options.tracerProvider!.getTracer(
       options.instrumentationName ?? '@open-multi-agent/otel',
-      options.instrumentationVersion ?? '1.10.0',
+      options.instrumentationVersion ?? PACKAGE_VERSION,
     )
     this.shutdownOnShutdown = options.shutdownOnShutdown ?? false
     this.metadata = {
@@ -156,8 +180,9 @@ export class OTelTraceExporter implements TraceExporter {
         this.accept(record)
         exported++
       } catch {
-        this.diagnostic('span_start_failed', 'The OpenTelemetry tracer rejected an OMA trace record.')
-        return Promise.resolve({ status: 'failure', exported, code: 'OTEL_RECORD_REJECTED' })
+        const failure = ACCEPT_FAILURES[record.recordType]
+        this.diagnostic(failure.diagnostic, failure.message)
+        return Promise.resolve({ status: 'failure', exported, code: failure.code })
       }
     }
     return Promise.resolve({ status: 'success', exported })
@@ -245,38 +270,33 @@ export class OTelTraceExporter implements TraceExporter {
       }
       this.openSpans.set(key, entry)
     }
-    try {
-      entry.span.setAttributes({
-        ...spanAttributes(record),
-        ...this.metadata,
-        'oma.status': record.status.code,
-      })
-      this.addEndLinks(entry, record.links)
-      entry.span.setStatus(mapStatus(record.status))
-      if (record.error) {
-        const errorAttributes: Attributes = {
-          'error.type': record.error.code ?? record.error.kind,
-          'oma.error.kind': record.error.kind,
-          ...(record.error.code ? { 'oma.error.code': record.error.code } : {}),
-          ...(record.error.name ? { 'oma.error.name': record.error.name } : {}),
-          ...(record.error.retryable !== undefined ? { 'oma.error.retryable': record.error.retryable } : {}),
-          ...(record.error.httpStatus !== undefined ? { 'oma.error.http_status': record.error.httpStatus } : {}),
-          ...(record.error.provider ? { 'oma.error.provider': record.error.provider } : {}),
-          ...(record.error.attempt !== undefined ? { 'oma.error.attempt': record.error.attempt } : {}),
-        }
-        entry.span.setAttributes(errorAttributes)
-        entry.span.addEvent('exception', errorAttributes, record.endUnixMs)
+    entry.span.setAttributes({
+      ...spanAttributes(record),
+      ...this.metadata,
+      'oma.status': record.status.code,
+    })
+    this.addEndLinks(entry, record.links)
+    entry.span.setStatus(mapStatus(record.status))
+    if (record.error) {
+      const errorAttributes: Attributes = {
+        'error.type': record.error.code ?? record.error.kind,
+        'oma.error.kind': record.error.kind,
+        ...(record.error.code ? { 'oma.error.code': record.error.code } : {}),
+        ...(record.error.name ? { 'oma.error.name': record.error.name } : {}),
+        ...(record.error.retryable !== undefined ? { 'oma.error.retryable': record.error.retryable } : {}),
+        ...(record.error.httpStatus !== undefined ? { 'oma.error.http_status': record.error.httpStatus } : {}),
+        ...(record.error.provider ? { 'oma.error.provider': record.error.provider } : {}),
+        ...(record.error.attempt !== undefined ? { 'oma.error.attempt': record.error.attempt } : {}),
       }
-      entry.span.end(record.endUnixMs)
-      this.openSpans.delete(key)
-      if (record.kind === 'run') {
-        const rootContext = this.spanContexts.get(key)
-        if (rootContext) this.rememberRootContext(key, rootContext)
-        this.finalizeTrace(record.traceId, record.endUnixMs)
-      }
-    } catch {
-      this.diagnostic('span_end_failed', 'The OpenTelemetry tracer rejected an OMA span_end record.')
-      throw new Error('OTEL_SPAN_END_FAILED')
+      entry.span.setAttributes(errorAttributes)
+      entry.span.addEvent('exception', errorAttributes, record.endUnixMs)
+    }
+    entry.span.end(record.endUnixMs)
+    this.openSpans.delete(key)
+    if (record.kind === 'run') {
+      const rootContext = this.spanContexts.get(key)
+      if (rootContext) this.rememberRootContext(key, rootContext)
+      this.finalizeTrace(record.traceId, record.endUnixMs)
     }
   }
 
